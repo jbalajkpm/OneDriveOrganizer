@@ -148,6 +148,157 @@ public sealed class SafetyRegressionTests : IDisposable
         await Assert.ThrowsAsync<IOException>(() => new ClassificationService(Index, new RuleEngine(), reports, media).Classify(Options, P("plan.csv"), P("custom.json"), 0.7, false, 3, Token));
     }
 
+    [Fact]
+    public async Task OneDriveSyncMarkerIsProtectedAndRemovedFromOldIndexes()
+    {
+        var marker = Put(".849C9593-D756-4E56-8D6E-42412F2A707B", "sync state");
+        var ordinary = Put(".12345678-1234-1234-1234-123456789012", "user content");
+        using (var store = new IndexStore(root)) store.Save([new FileRecord { Path = marker }]);
+        var files = await Index.Refresh(Options, Token);
+        Assert.Equal(ordinary, Assert.Single(files).Path);
+        using (var store = new IndexStore(root)) Assert.False(store.Load().ContainsKey(marker));
+        Assert.True(PathPolicy.ProtectedName(marker.ToLowerInvariant()));
+        Assert.Throws<IOException>(() => new PathPolicy(Options).AssertAllowed(marker));
+        Assert.Equal("sync state", File.ReadAllText(marker));
+    }
+
+    [WindowsFileLockFact]
+    public async Task LockedFilesAreSkippedAndRetriedAfterUnlocking()
+    {
+        var readable = Put("readable.txt", "available");
+        var locked = Put("locked.txt", "busy");
+        using (var held = new FileStream(locked, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            Assert.Equal(readable, Assert.Single(await Index.Refresh(Options, Token)).Path);
+            using (var store = new IndexStore(root)) Assert.Equal(readable, Assert.Single(store.Load()).Key);
+            await Assert.ThrowsAsync<IOException>(() => HashService.Sha256(locked, Token));
+        }
+        var refreshed = await Index.Refresh(Options, Token);
+        Assert.Equal(2, refreshed.Count);
+        Assert.Equal(await HashService.Sha256(locked, Token, partial: true), refreshed.Single(f => f.Path == locked).PartialHash);
+        Assert.Equal("busy", File.ReadAllText(locked));
+    }
+
+    [WindowsFileLockFact]
+    public async Task CachedFilesAreNotReusedWhileLocked()
+    {
+        var locked = Put("cached.txt", "unchanged");
+        var files = await Index.Refresh(Options, Token);
+        await Index.FullHashes(files, Options, Token);
+        IndexService.Persist(root, files);
+        Assert.NotNull(Assert.Single(files).FullHash);
+        using (var held = new FileStream(locked, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            Assert.Equal(files[0].LastWriteUtc, File.GetLastWriteTimeUtc(locked));
+            Assert.Empty(await Index.Refresh(Options, Token));
+            using var store = new IndexStore(root);
+            Assert.Empty(store.Load());
+        }
+        var refreshed = Assert.Single(await Index.Refresh(Options, Token));
+        Assert.Equal(locked, refreshed.Path);
+        Assert.Equal(files[0].PartialHash, refreshed.PartialHash);
+        Assert.Null(refreshed.FullHash);
+    }
+
+    [WindowsFileLockFact]
+    public async Task LockAfterReportCreationStillBlocksCleanup()
+    {
+        Put("a.txt", "duplicate"); Put("b.txt", "duplicate");
+        var rows = await new DedupService(Index, reports, media).Dupes(Options, P("dupes.csv"), "oldest", null, Token);
+        var deletion = Assert.Single(rows, r => !r.Keep);
+        using var held = new FileStream(deletion.Path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        await Assert.ThrowsAsync<IOException>(() => new ExecutionService().Apply(P("dupes.csv"), false, true, true, false, false, P("undo.json"), Token));
+        Assert.All(rows, row => Assert.True(File.Exists(row.Path)));
+        Assert.False(File.Exists(P("undo.json")));
+    }
+
+    [Theory]
+    [InlineData(65001)]
+    [InlineData(1200)]
+    [InlineData(1201)]
+    [InlineData(12000)]
+    [InlineData(12001)]
+    public async Task CachedUnicodeDocumentsArePlannedAsTextAndMovedWithoutChangingEncoding(int codePage)
+    {
+        var path = P("diagnostic.txt");
+        File.WriteAllText(path, string.Concat(Enumerable.Repeat("Diagnostic report\r\nName\tValue\r\n", 500)), System.Text.Encoding.GetEncoding(codePage));
+        var bytes = File.ReadAllBytes(path);
+        await Index.Refresh(Options, Token);
+        var row = Assert.Single(await Plan());
+        Assert.Equal("Text", row.DetectedType);
+        Assert.Equal("Documents/Text", row.Category);
+        Assert.Equal("Move", row.Status);
+        Assert.Equal(P("Documents/Text/diagnostic.txt"), row.TargetPath);
+        Assert.Equal(bytes, File.ReadAllBytes(path));
+        var execution = new ExecutionService();
+        await execution.Apply(P("plan.csv"), true, false, false, false, false, P("undo.json"), Token);
+        Assert.Equal(bytes, File.ReadAllBytes(path));
+        Assert.False(File.Exists(P("undo.json")));
+        await execution.Apply(P("plan.csv"), true, true, true, false, false, P("undo.json"), Token);
+        Assert.False(File.Exists(path));
+        Assert.Equal(bytes, File.ReadAllBytes(row.TargetPath));
+        await execution.Undo(P("undo.json"), true, true, Token);
+        Assert.Equal(bytes, File.ReadAllBytes(path));
+    }
+
+    [Theory]
+    [InlineData(".loop")]
+    [InlineData(".LOOP")]
+    [InlineData(".LoOp")]
+    public async Task LoopFilesAreExcludedFromIndexesAndRepositoryMoves(string extension)
+    {
+        var loop = Put("repository/meeting" + extension, "Loop content must not be read");
+        var ordinary = Put("ordinary.txt", "available");
+        using (var store = new IndexStore(root)) store.Save([new FileRecord { Path = loop }]);
+        using var held = new FileStream(loop, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        Assert.Equal(ordinary, Assert.Single(await Index.Refresh(Options with { SkipOffline = false }, Token)).Path);
+        using (var store = new IndexStore(root)) Assert.False(store.Load().ContainsKey(loop));
+        Assert.Throws<IOException>(() => new PathPolicy(Options).AssertAllowed(loop));
+        var error = await Assert.ThrowsAsync<IOException>(() => HashService.Fingerprint(P("repository"), true, Token));
+        Assert.Equal($"Repository contains a protected/offline/link entry: {loop}", error.Message);
+        Directory.CreateDirectory(P("repository/.git"));
+        Put("repository/code.cs", "class Example { }");
+        var repository = Assert.Single(await Plan(), row => row.IsDirectory);
+        Assert.Equal("Protected", repository.Status);
+    }
+
+    [Theory]
+    [InlineData("classify", true)]
+    [InlineData("dupes", false)]
+    public async Task OldReportsCannotMoveOrDeleteLoopFiles(string kind, bool organize)
+    {
+        var loop = Put("meeting.loop", "preserve me");
+        var keeper = Put("keeper.txt", "preserve me");
+        var row = new ReportRow { Path = loop, TargetPath = P("moved.loop"), KeptPath = keeper, Keep = false, Status = organize ? "Move" : "ExactDuplicate" };
+        var report = P("old.csv");
+        ReportStore.WriteCsv(report, [row]);
+        ReportStore.WriteJson(report + ".manifest.json", new ReportManifest { Root = root, Kind = kind, Rows = [row], MediaAnalysisVersion = MediaService.AnalysisVersion });
+        await Assert.ThrowsAsync<IOException>(() => new ExecutionService().Apply(report, organize, true, true, false, false, P("undo.json"), Token));
+        Assert.Equal("preserve me", File.ReadAllText(loop));
+        Assert.False(File.Exists(P("undo.json")));
+    }
+
+    [Fact]
+    public async Task OldUndoJournalsCannotRestoreLoopFiles()
+    {
+        var original = P("meeting.loop");
+        var destination = Put("_Trash/meeting.loop", "preserve me");
+        var journal = P("old-undo.json");
+        ReportStore.WriteJson(journal, new UndoJournal { Root = root, Entries =
+            [new UndoEntry { Original = original, Destination = destination, Action = "Trash", State = "Applied" }] });
+        await Assert.ThrowsAsync<IOException>(() => new ExecutionService().Undo(journal, true, true, Token));
+        Assert.False(File.Exists(original));
+        Assert.Equal("preserve me", File.ReadAllText(destination));
+    }
+
+    private sealed class WindowsFileLockFactAttribute : FactAttribute
+    {
+        public WindowsFileLockFactAttribute()
+        {
+            if (!OperatingSystem.IsWindows()) Skip = "Requires Windows mandatory file-sharing locks.";
+        }
+    }
+
     public void Dispose()
     {
         SqliteConnection.ClearAllPools(); Directory.Delete(root, true);

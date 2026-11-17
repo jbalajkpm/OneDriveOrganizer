@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Numerics;
 using System.Security.Cryptography;
 using OneDriveOrganizer.Infrastructure;
+using Serilog;
 
 namespace OneDriveOrganizer.Services;
 
@@ -10,11 +11,19 @@ public sealed class HashService
     public const int PartialBytes = 64 * 1024;
     public static async Task<string> Sha256(string path, CancellationToken token, bool partial = false)
     {
-        await using var stream = Open(path);
-        if (!partial) return Convert.ToHexString(await SHA256.HashDataAsync(stream, token));
-        var buffer = new byte[PartialBytes];
-        var count = await stream.ReadAtLeastAsync(buffer, buffer.Length, false, token);
-        return Convert.ToHexString(SHA256.HashData(buffer.AsSpan(0, count)));
+        try
+        {
+            await using var stream = Open(path);
+            if (!partial) return Convert.ToHexString(await SHA256.HashDataAsync(stream, token));
+            var buffer = new byte[PartialBytes];
+            var count = await stream.ReadAtLeastAsync(buffer, buffer.Length, false, token);
+            return Convert.ToHexString(SHA256.HashData(buffer.AsSpan(0, count)));
+        }
+        catch (IOException ex)
+        {
+            Log.Error("Cannot read file {Path} (HRESULT 0x{HResult:X8}): {Error}", path, ex.HResult, ex.Message);
+            throw;
+        }
     }
 
     public static FileStream Open(string path) => new(path, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);

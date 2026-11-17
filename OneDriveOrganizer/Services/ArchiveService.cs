@@ -29,6 +29,14 @@ public sealed class ArchiveService(IndexService index, ReportStore reports)
             try
             {
                 using var zip = ZipFile.OpenRead(file.Path);
+                if (zip.Entries.Any(entry => entry.IsEncrypted))
+                {
+                    row.Status = "Protected";
+                    row.Keep = true;
+                    row.Reason = "Password-protected ZIP; entry contents were not opened";
+                    Log.Information("Protected archive left intact: {Path}", file.Path);
+                    continue;
+                }
                 var members = zip.Entries.Where(e => !string.IsNullOrEmpty(e.Name)).ToList();
                 if (members.Count > 100_000 || members.Sum(e => (decimal)e.Length) > 2L * 1024 * 1024 * 1024)
                 {
