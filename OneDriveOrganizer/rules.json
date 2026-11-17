@@ -1,0 +1,16 @@
+[
+  { "name": "Photos/People", "aiLabel": "people", "target": "Photos/{yyyy}/{yyyy-MM}/People" },
+  { "name": "Photos/Pets", "aiLabel": "pets", "target": "Photos/{yyyy}/{yyyy-MM}/Pets" },
+  { "name": "Photos/Food", "aiLabel": "food", "target": "Photos/{yyyy}/{yyyy-MM}/Food" },
+  { "name": "Photos/Documents", "aiLabel": "documents", "target": "Photos/{yyyy}/{yyyy-MM}/Documents", "sensitive": true },
+  { "name": "AI-Screenshots", "aiLabel": "screenshots", "aiCategory": "Photos/Screenshots", "target": "Photos/{yyyy}/{yyyy-MM}/Screenshots", "sensitive": true },
+  { "name": "Photos/Landscapes", "aiLabel": "landscapes", "target": "Photos/{yyyy}/{yyyy-MM}/Landscapes" },
+  { "name": "Photos/Vehicles", "aiLabel": "vehicles", "target": "Photos/{yyyy}/{yyyy-MM}/Vehicles" },
+  { "name": "Photos/Receipts", "aiLabel": "receipts", "target": "Photos/{yyyy}/{yyyy-MM}/Receipts", "sensitive": true },
+  { "name": "Photos/Whiteboards", "aiLabel": "whiteboards", "target": "Photos/{yyyy}/{yyyy-MM}/Whiteboards", "sensitive": true },
+  { "name": "Photos/Memes", "aiLabel": "memes", "target": "Photos/{yyyy}/{yyyy-MM}/Memes" },
+  { "name": "Documents/PDF/Identity", "priority": 100, "magicBytes": ["25504446"], "textKeywords": ["passport", "licence", "PPS"], "target": "Documents/PDF/Identity", "confidence": 0.9, "sensitive": true },
+  { "name": "Documents/PDF/Finance", "priority": 90, "magicBytes": ["25504446"], "textKeywords": ["invoice", "receipt", "payslip", "bank statement", "P60", "Revenue"], "target": "Documents/PDF/Finance", "confidence": 0.9 },
+  { "name": "Photos/Screenshots", "priority": 80, "magicBytes": ["89504E470D0A1A0A", "FFD8FF"], "filenameRegex": "^Screenshot", "target": "Photos/{yyyy}/{yyyy-MM}/Screenshots", "confidence": 0.92 },
+  { "name": "Photos/WhatsApp", "priority": 70, "magicBytes": ["FFD8FF", "89504E470D0A1A0A"], "filenameRegex": "^(WhatsApp|IMG-\\d{8}-WA)", "target": "Photos/{yyyy}/{yyyy-MM}/WhatsApp", "confidence": 0.88 }
+]

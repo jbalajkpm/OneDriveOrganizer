@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="OneDriveOrganizer.Tests/OneDriveOrganizer.Tests.csproj" />
+  <Project Path="OneDriveOrganizer/OneDriveOrganizer.csproj" />
+</Solution>
