@@ -16,39 +16,53 @@ public sealed class IndexService(MediaService media)
         var artifacts = store.Artifacts();
         var files = policy.Enumerate(token).Where(p => !artifacts.Contains(p)).ToList();
         var results = new ConcurrentBag<FileRecord>();
-        int done = 0, reused = 0, refreshedMedia = 0;
+        int done = 0, reused = 0, refreshedMedia = 0, skippedLocked = 0;
         await Parallel.ForEachAsync(files, new ParallelOptions { CancellationToken = token, MaxDegreeOfParallelism = options.Parallelism }, async (path, ct) =>
         {
-            policy.AssertAllowed(path);
-            var info = new FileInfo(path);
-            if (previous.TryGetValue(path, out var old) && old.Size == info.Length && old.LastWriteUtc == info.LastWriteTimeUtc)
+            try
             {
-                old.Attributes = (int)info.Attributes;
-                if ((MediaService.Images.Contains(old.Extension) || MediaService.Videos.Contains(old.Extension)) && old.MediaAnalysisVersion != MediaService.AnalysisVersion)
+                policy.AssertAllowed(path);
+                // Check cached files too, and keep writers out during hashing and metadata reads.
+                using var readLease = HashService.Open(path);
+                var info = new FileInfo(path);
+                if (previous.TryGetValue(path, out var old) && old.Size == info.Length && old.LastWriteUtc == info.LastWriteTimeUtc)
                 {
-                    await media.Read(old, ct);
-                    AssertUnchanged(old, policy);
-                    Interlocked.Increment(ref refreshedMedia);
+                    old.Attributes = (int)info.Attributes;
+                    if ((MediaService.Images.Contains(old.Extension) || MediaService.Videos.Contains(old.Extension)) && old.MediaAnalysisVersion != MediaService.AnalysisVersion)
+                    {
+                        await media.Read(old, ct);
+                        AssertUnchanged(old, policy);
+                        Interlocked.Increment(ref refreshedMedia);
+                    }
+                    results.Add(old);
+                    Interlocked.Increment(ref reused);
                 }
-                results.Add(old);
-                Interlocked.Increment(ref reused);
+                else
+                {
+                    var file = new FileRecord { Path = path, Size = info.Length, CreatedUtc = info.CreationTimeUtc, LastWriteUtc = info.LastWriteTimeUtc,
+                        Attributes = (int)info.Attributes, Extension = info.Extension.ToLowerInvariant(), Conflict = PathPolicy.Conflict(path) };
+                    file.PartialHash = await HashService.Sha256(path, ct, partial: true);
+                    await media.Read(file, ct);
+                    AssertUnchanged(file, policy);
+                    results.Add(file);
+                }
             }
-            else
+            catch (IOException ex) when (ex.HResult is unchecked((int)0x80070020) or unchecked((int)0x80070021))
             {
-                var file = new FileRecord { Path = path, Size = info.Length, CreatedUtc = info.CreationTimeUtc, LastWriteUtc = info.LastWriteTimeUtc,
-                    Attributes = (int)info.Attributes, Extension = info.Extension.ToLowerInvariant(), Conflict = PathPolicy.Conflict(path) };
-                file.PartialHash = await HashService.Sha256(path, ct, partial: true);
-                await media.Read(file, ct);
-                AssertUnchanged(file, policy);
-                results.Add(file);
+                ct.ThrowIfCancellationRequested();
+                Interlocked.Increment(ref skippedLocked);
+                Log.Warning("Skipping locked file {Path}; retry on the next scan: {Error}", path, ex.Message);
             }
-            var n = Interlocked.Increment(ref done);
-            if (n % 100 == 0 || n == files.Count) Log.Information("Index {Done}/{Total}", n, files.Count);
+            finally
+            {
+                var n = Interlocked.Increment(ref done);
+                if (n % 100 == 0 || n == files.Count) Log.Information("Index {Done}/{Total}", n, files.Count);
+            }
         });
         var sorted = results.OrderBy(f => f.Path, PathPolicy.Comparer).ToList();
         token.ThrowIfCancellationRequested();
         store.Save(sorted);
-        Log.Information("Indexed {Count}; reused {Reused}; refreshed media analysis {Refreshed}; offline placeholders skipped {Skipped}", sorted.Count, reused, refreshedMedia, policy.SkippedOffline);
+        Log.Information("Indexed {Count}; reused {Reused}; refreshed media analysis {Refreshed}; offline placeholders skipped {Skipped}; locked files skipped {Locked}", sorted.Count, reused, refreshedMedia, policy.SkippedOffline, skippedLocked);
         return sorted;
     }
 

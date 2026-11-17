@@ -148,6 +148,78 @@ public sealed class SafetyRegressionTests : IDisposable
         await Assert.ThrowsAsync<IOException>(() => new ClassificationService(Index, new RuleEngine(), reports, media).Classify(Options, P("plan.csv"), P("custom.json"), 0.7, false, 3, Token));
     }
 
+    [Fact]
+    public async Task OneDriveSyncMarkerIsProtectedAndRemovedFromOldIndexes()
+    {
+        var marker = Put(".849C9593-D756-4E56-8D6E-42412F2A707B", "sync state");
+        var ordinary = Put(".12345678-1234-1234-1234-123456789012", "user content");
+        using (var store = new IndexStore(root)) store.Save([new FileRecord { Path = marker }]);
+        var files = await Index.Refresh(Options, Token);
+        Assert.Equal(ordinary, Assert.Single(files).Path);
+        using (var store = new IndexStore(root)) Assert.False(store.Load().ContainsKey(marker));
+        Assert.True(PathPolicy.ProtectedName(marker.ToLowerInvariant()));
+        Assert.Throws<IOException>(() => new PathPolicy(Options).AssertAllowed(marker));
+        Assert.Equal("sync state", File.ReadAllText(marker));
+    }
+
+    [WindowsFileLockFact]
+    public async Task LockedFilesAreSkippedAndRetriedAfterUnlocking()
+    {
+        var readable = Put("readable.txt", "available");
+        var locked = Put("locked.txt", "busy");
+        using (var held = new FileStream(locked, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            Assert.Equal(readable, Assert.Single(await Index.Refresh(Options, Token)).Path);
+            using (var store = new IndexStore(root)) Assert.Equal(readable, Assert.Single(store.Load()).Key);
+            await Assert.ThrowsAsync<IOException>(() => HashService.Sha256(locked, Token));
+        }
+        var refreshed = await Index.Refresh(Options, Token);
+        Assert.Equal(2, refreshed.Count);
+        Assert.Equal(await HashService.Sha256(locked, Token, partial: true), refreshed.Single(f => f.Path == locked).PartialHash);
+        Assert.Equal("busy", File.ReadAllText(locked));
+    }
+
+    [WindowsFileLockFact]
+    public async Task CachedFilesAreNotReusedWhileLocked()
+    {
+        var locked = Put("cached.txt", "unchanged");
+        var files = await Index.Refresh(Options, Token);
+        await Index.FullHashes(files, Options, Token);
+        IndexService.Persist(root, files);
+        Assert.NotNull(Assert.Single(files).FullHash);
+        using (var held = new FileStream(locked, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            Assert.Equal(files[0].LastWriteUtc, File.GetLastWriteTimeUtc(locked));
+            Assert.Empty(await Index.Refresh(Options, Token));
+            using var store = new IndexStore(root);
+            Assert.Empty(store.Load());
+        }
+        var refreshed = Assert.Single(await Index.Refresh(Options, Token));
+        Assert.Equal(locked, refreshed.Path);
+        Assert.Equal(files[0].PartialHash, refreshed.PartialHash);
+        Assert.Null(refreshed.FullHash);
+    }
+
+    [WindowsFileLockFact]
+    public async Task LockAfterReportCreationStillBlocksCleanup()
+    {
+        Put("a.txt", "duplicate"); Put("b.txt", "duplicate");
+        var rows = await new DedupService(Index, reports, media).Dupes(Options, P("dupes.csv"), "oldest", null, Token);
+        var deletion = Assert.Single(rows, r => !r.Keep);
+        using var held = new FileStream(deletion.Path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        await Assert.ThrowsAsync<IOException>(() => new ExecutionService().Apply(P("dupes.csv"), false, true, true, false, false, P("undo.json"), Token));
+        Assert.All(rows, row => Assert.True(File.Exists(row.Path)));
+        Assert.False(File.Exists(P("undo.json")));
+    }
+
+    private sealed class WindowsFileLockFactAttribute : FactAttribute
+    {
+        public WindowsFileLockFactAttribute()
+        {
+            if (!OperatingSystem.IsWindows()) Skip = "Requires Windows mandatory file-sharing locks.";
+        }
+    }
+
     public void Dispose()
     {
         SqliteConnection.ClearAllPools(); Directory.Delete(root, true);
