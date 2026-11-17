@@ -41,7 +41,7 @@ public sealed class PathPolicy
     public static bool IsLink(FileAttributes attributes) => (attributes & FileAttributes.ReparsePoint) != 0;
     public static bool IsLink(string path) => (Directory.Exists(path) ? (FileSystemInfo)new DirectoryInfo(path) : new FileInfo(path)).LinkTarget != null;
     public static bool ProtectedName(string path) => new[] { "desktop.ini", "Thumbs.db", ".DS_Store", ".849C9593-D756-4E56-8D6E-42412F2A707B" }.Contains(System.IO.Path.GetFileName(path), StringComparer.OrdinalIgnoreCase) ||
-        System.IO.Path.GetExtension(path).Equals(".lnk", StringComparison.OrdinalIgnoreCase);
+        new[] { ".lnk", ".loop" }.Contains(System.IO.Path.GetExtension(path), StringComparer.OrdinalIgnoreCase);
 
     public bool Excluded(string path) => !Within(path, Root) || Excludes.Any(p => Within(path, p)) ||
         System.IO.Path.GetRelativePath(Root, path).Split(System.IO.Path.DirectorySeparatorChar).Any(p => p is ".odo" or "_Trash" or ".git") || ProtectedName(path);

@@ -74,4 +74,32 @@ public sealed class AlgorithmBoundaryTests
     {
         Assert.Equal("Unknown", ClassificationService.DetectType([0xC0, 0xC0, 0xFF], "note.txt"));
     }
+
+    [Theory]
+    [InlineData(65001)]
+    [InlineData(1200)]
+    [InlineData(1201)]
+    [InlineData(12000)]
+    [InlineData(12001)]
+    public void BomEncodedTextTakesPrecedenceOverAudioSyncBytes(int codePage)
+    {
+        var encoding = Encoding.GetEncoding(codePage);
+        var header = encoding.GetPreamble().Concat(encoding.GetBytes("Diagnostic report\r\nName\tValue\r\n\u03A9 \u4E2D \U0001F642")).ToArray();
+        Assert.Equal("Text", ClassificationService.DetectType(header, "diagnostic.txt"));
+        Assert.Equal("Text", ClassificationService.DetectType(header, "misleading.mp3"));
+        Assert.Equal("Text", ClassificationService.DetectType(header[..^1], "sample-ending-mid-character.txt"));
+    }
+
+    [Theory]
+    [InlineData("49443304000000000000")]
+    [InlineData("664C614300000022")]
+    [InlineData("4F6767530002")]
+    [InlineData("FFFB90640000")]
+    [InlineData("FFFE400000000000")]
+    [InlineData("FFF15080001FFC")]
+    [InlineData("524946462400000057415645")]
+    public void AudioSignaturesStillOverrideMisleadingTextExtensions(string hex)
+    {
+        Assert.Equal("Audio", ClassificationService.DetectType(Convert.FromHexString(hex), "misleading.txt"));
+    }
 }

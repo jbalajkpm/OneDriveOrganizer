@@ -6,6 +6,7 @@ using OneDriveOrganizer.Models;
 using OneDriveOrganizer.Services.AI;
 using Serilog;
 using UglyToad.PdfPig;
+using UglyToad.PdfPig.Exceptions;
 
 namespace OneDriveOrganizer.Services;
 
@@ -52,10 +53,49 @@ public sealed class ClassificationService(IndexService index, RuleEngine engine,
             }
             var header = new byte[(int)Math.Min(file.Size, 8192)];
             await using (var stream = HashService.Open(file.Path)) await stream.ReadExactlyAsync(header, token);
-            string type = DetectType(header, file.Path);
+            string type = "Unknown";
+            try
+            {
+                type = DetectType(header, file.Path);
+                bool protectedContent = type == "PDF" && PdfEncryption.IsEncrypted(file.Path, token);
+                if (header.AsSpan().StartsWith("PK\u0003\u0004"u8) || header.AsSpan().StartsWith("PK\u0005\u0006"u8))
+                {
+                    using var zip = ZipFile.OpenRead(file.Path);
+                    protectedContent |= zip.Entries.Any(entry => entry.IsEncrypted);
+                }
+                if (header.AsSpan().StartsWith(Convert.FromHexString("D0CF11E0A1B11AE1")))
+                {
+                    using var stream = HashService.Open(file.Path);
+                    using var storage = OpenMcdf.RootStorage.Open(stream);
+                    protectedContent |= storage.TryGetEntryInfo("EncryptionInfo", out var info) && info.Type == OpenMcdf.EntryType.Stream &&
+                        storage.TryGetEntryInfo("EncryptedPackage", out var package) && package.Type == OpenMcdf.EntryType.Stream;
+                    if (protectedContent) type = "EncryptedOffice";
+                }
+                if (protectedContent)
+                {
+                    rows.Add(ProtectedMove(file, type, policy));
+                    IndexService.AssertUnchanged(file, policy);
+                    continue;
+                }
+            }
+            catch (Exception ex) when (ex is InvalidDataException or EndOfStreamException or NotSupportedException or
+                OpenMcdf.FileFormatException or UglyToad.PdfPig.Core.PdfDocumentFormatException)
+            {
+                Log.Warning("Protection metadata unavailable; leaving for review {Path}: {Error}", file.Path, ex.Message);
+                rows.Add(DedupService.Row(file) with { DetectedType = type, Category = "Review", Confidence = 0,
+                    TargetPath = file.Path, Status = "Review", Sensitive = true, Reason = "Protection metadata unavailable; content not inspected: " + ex.Message });
+                IndexService.AssertUnchanged(file, policy);
+                continue;
+            }
             string text = Path.GetFileNameWithoutExtension(file.Path);
-            bool inspected = false;
-            string content = type is "PDF" or "Word" ? ReadDocument(file, type, out inspected) : "";
+            bool inspected = false, encrypted = false;
+            string content = type is "PDF" or "Word" ? ReadDocument(file, type, out inspected, out encrypted) : "";
+            if (encrypted)
+            {
+                rows.Add(ProtectedMove(file, type, policy));
+                IndexService.AssertUnchanged(file, policy);
+                continue;
+            }
             if (type == "Text" && ai != null)
             {
                 using var reader = new StreamReader(HashService.Open(file.Path), Encoding.UTF8, true);
@@ -198,12 +238,29 @@ public sealed class ClassificationService(IndexService index, RuleEngine engine,
         return rows;
     }
 
+    private static ReportRow ProtectedMove(FileRecord file, string type, PathPolicy policy)
+    {
+        var folder = Path.Combine(policy.Root, "_PasswordProtected");
+        policy.AssertAllowed(folder);
+        bool placed = PathPolicy.Within(file.Path, folder);
+        Log.Information("Protected document will be kept intact: {Path}", file.Path);
+        return DedupService.Row(file) with { DetectedType = type, Category = "PasswordProtected", Confidence = 1,
+            TargetPath = placed ? file.Path : Path.Combine(folder, Path.GetFileName(file.Path)), Status = placed ? "AlreadyPlaced" : "Move",
+            Sensitive = true, Reason = "Encryption/password protection detected; no content extraction; move intact only after review" };
+    }
+
     public static bool HasWord(string text, string[] words) => words.Any(word => System.Text.RegularExpressions.Regex.IsMatch(text,
         @"(?<!\p{L})" + System.Text.RegularExpressions.Regex.Escape(word) + @"(?!\p{L})", System.Text.RegularExpressions.RegexOptions.IgnoreCase, TimeSpan.FromSeconds(1)));
 
     public static string DetectType(byte[] h, string path)
     {
         bool Starts(string hex) => h.AsSpan().StartsWith(Convert.FromHexString(hex));
+        Encoding? unicode = Starts("FFFE0000") ? new UTF32Encoding(false, true, true) :
+            Starts("0000FEFF") ? new UTF32Encoding(true, true, true) :
+            Starts("FFFE") ? new UnicodeEncoding(false, true, true) :
+            Starts("FEFF") ? new UnicodeEncoding(true, true, true) : null;
+        // FF FE is both a Unicode BOM prefix and a possible MPEG frame sync; validate text first.
+        if (unicode != null && IsText(h, unicode)) return "Text";
         if (Starts("25504446")) return "PDF";
         if (Starts("7B5C727466")) return "Word";
         if (Starts("FFD8FF") || Starts("89504E470D0A1A0A") || Starts("47494638") || Starts("424D") || Starts("49492A00") || Starts("4D4D002A")) return "Image";
@@ -243,22 +300,25 @@ public sealed class ClassificationService(IndexService index, RuleEngine engine,
                 if (Encoding.ASCII.GetString(signature) == "koly") return "Installer";
             }
         }
+        return unicode == null && IsText(h, new UTF8Encoding(false, true)) ? "Text" : "Unknown";
+    }
+
+    private static bool IsText(byte[] h, Encoding encoding)
+    {
         try
         {
-            var encoding = h.AsSpan().StartsWith(new byte[] { 255, 254 }) ? (Encoding)new UnicodeEncoding(false, true, true) :
-                h.AsSpan().StartsWith(new byte[] { 254, 255 }) ? new UnicodeEncoding(true, true, true) : new UTF8Encoding(false, true);
             var decoder = encoding.GetDecoder();
             var chars = new char[encoding.GetMaxCharCount(h.Length)];
             int count = decoder.GetChars(h, 0, h.Length, chars, 0, flush: false);
-            if (chars.Take(count).All(c => !char.IsControl(c) || c is '\t' or '\r' or '\n')) return "Text";
+            return chars.Take(count).All(c => !char.IsControl(c) || c is '\t' or '\r' or '\n');
         }
-        catch (DecoderFallbackException) { return "Unknown"; }
-        return "Unknown";
+        catch (DecoderFallbackException) { return false; }
     }
 
-    private static string ReadDocument(FileRecord file, string type, out bool inspected)
+    private static string ReadDocument(FileRecord file, string type, out bool inspected, out bool encrypted)
     {
         inspected = false;
+        encrypted = false;
         if (file.Size > 50 * 1024 * 1024) { Log.Warning("Text inspection limit (50 MiB): {Path}", file.Path); return ""; }
         try
         {
@@ -274,6 +334,12 @@ public sealed class ClassificationService(IndexService index, RuleEngine engine,
             var text = new StringBuilder();
             while (text.Length < 12000 && reader.Read()) if (reader.NodeType == XmlNodeType.Text) text.Append(reader.Value).Append(' ');
             return text.ToString();
+        }
+        catch (PdfDocumentEncryptedException ex)
+        {
+            encrypted = true;
+            Log.Warning("PDF parser reported protection; no further content inspection for {Path}: {Error}", file.Path, ex.Message);
+            return "";
         }
         catch (Exception ex) when (ex is InvalidDataException or XmlException or UglyToad.PdfPig.Core.PdfDocumentFormatException)
         { Log.Warning("Document text unavailable {Path}: {Error}", file.Path, ex.Message); return ""; }

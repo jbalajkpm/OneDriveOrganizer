@@ -6,6 +6,8 @@ using OneDriveOrganizer.Infrastructure;
 using OneDriveOrganizer.Models;
 using OneDriveOrganizer.Services;
 using OneDriveOrganizer.Services.AI;
+using UglyToad.PdfPig;
+using UglyToad.PdfPig.Exceptions;
 
 namespace OneDriveOrganizer.Tests;
 
@@ -15,6 +17,8 @@ public sealed class AiTests : IDisposable
     private static CancellationToken Token => CancellationToken.None;
     private ScanOptions Scan => new(root, [], true, 2);
     private const string Valid = """{"category":"Documents","subcategory":"Reference","confidence":0.95,"suggestedFileName":"descriptive-notes","isSensitive":false,"reason":"Document content"}""";
+    // Synthetic blank PDF, standard revision-2 encryption, with the test-only user password "fixture-user".
+    private const string EncryptedPdf = "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCAxMDAgMTAwXSAvUmVzb3VyY2VzIDw8ID4+ID4+CmVuZG9iago0IDAgb2JqCjw8IC9GaWx0ZXIgL1N0YW5kYXJkIC9WIDEgL1IgMiAvTyA8YjgwOGVlYzFhZjRmNTA1ZDI2NzcxMmY3NTZhZTEwODM1YTYxNTBmNWExMTcyOTZkNTQ5YjJkMDdlYzJkMmMwMD4gL1UgPGUxY2M1ZjIyZDk0YzI0OTk5YjdkYzY0ZTFkYjk0ZTVkNGNlY2FhOWEwZGI1MTc3ODkzMzkyYWIzMWU3N2Y4YWM+IC9QIC00ID4+CmVuZG9iagp4cmVmCjAgNQowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMDkgMDAwMDAgbiAKMDAwMDAwMDA1OCAwMDAwMCBuIAowMDAwMDAwMTE1IDAwMDAwIG4gCjAwMDAwMDAyMDMgMDAwMDAgbiAKdHJhaWxlcgo8PCAvU2l6ZSA1IC9Sb290IDEgMCBSIC9FbmNyeXB0IDQgMCBSIC9JRCBbPDAwMDEwMjAzMDQwNTA2MDcwODA5MGEwYjBjMGQwZTBmPiA8MDAwMTAyMDMwNDA1MDYwNzA4MDkwYTBiMGMwZDBlMGY+XSA+PgpzdGFydHhyZWYKMzk4CiUlRU9GCg==";
     public AiTests() => Directory.CreateDirectory(root);
     private string P(string name) => Path.Combine(root, name);
     private string Put(string name, string content) { string path = P(name); Directory.CreateDirectory(Path.GetDirectoryName(path)!); File.WriteAllText(path, content); return path; }
@@ -210,6 +214,209 @@ public sealed class AiTests : IDisposable
         Assert.Equal(2, entries.Count); Assert.NotEqual(entries[0].Destination, entries[1].Destination);
         Assert.All(entries, e => { Assert.Equal(".txt", Path.GetExtension(e.Destination)); Assert.Equal(root, Path.GetDirectoryName(e.Destination)); });
         await execution.Undo(journal, true, true, Token); Assert.True(File.Exists(first)); Assert.True(File.Exists(second));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(0.7)]
+    public async Task EncryptedPdfMovesIntactToSeparateFolderOnlyAfterReviewedExecution(double minimum)
+    {
+        var encrypted = P("a-invoice.pdf");
+        var bytes = Convert.FromBase64String(EncryptedPdf);
+        File.WriteAllBytes(encrypted, bytes);
+        Assert.Throws<PdfDocumentEncryptedException>(() => { using var pdf = PdfDocument.Open(encrypted); });
+        using (var pdf = PdfDocument.Open(encrypted, new ParsingOptions { Password = "fixture-user" }))
+        {
+            Assert.Equal(1, pdf.NumberOfPages);
+            Assert.Empty(pdf.GetPage(1).Text);
+        }
+        // No content streams are encrypted in this blank fixture; removing its trailer reference leaves a normal PDF.
+        var normal = Put("z-normal.pdf", System.Text.Encoding.ASCII.GetString(bytes).Replace("/Encrypt 4 0 R ", "", StringComparison.Ordinal));
+        using (var pdf = PdfDocument.Open(normal)) Assert.Equal(1, pdf.NumberOfPages);
+        var rules = P(".odo\\rules.json");
+        Directory.CreateDirectory(Path.GetDirectoryName(rules)!);
+        ReportStore.WriteJson(rules, new[] { new Rule { Name = "Forced", Extensions = [".pdf"], Target = "Documents/Forced", Confidence = 1 } });
+        var media = new MediaService();
+        var classifier = new ClassificationService(new(media), new(), new(), media);
+        var output = P("plan.csv");
+        var rows = await classifier.Classify(Scan, output, rules, minimum, false, 3, Token);
+        Assert.Equal(2, rows.Count);
+        var locked = Assert.Single(rows, row => row.Path == encrypted);
+        Assert.Equal("Move", locked.Status);
+        Assert.Equal("PasswordProtected", locked.Category);
+        Assert.Equal("PDF", locked.DetectedType);
+        Assert.Equal(1, locked.Confidence);
+        Assert.Equal(Path.Combine(root, "_PasswordProtected", "a-invoice.pdf"), locked.TargetPath);
+        Assert.True(locked.Keep);
+        Assert.True(locked.Sensitive);
+        Assert.Contains("no content extraction", locked.Reason);
+        Assert.Equal("Move", rows.Single(row => row.Path == normal).Status);
+        Assert.Equal(locked, ReportStore.ReadReviewed(output).Rows.Single(row => row.Path == encrypted));
+        var journal = P("undo.json");
+        var execution = new ExecutionService();
+        await execution.Apply(output, true, false, false, false, false, journal, Token);
+        Assert.True(File.Exists(encrypted));
+        Assert.False(File.Exists(journal));
+        await Assert.ThrowsAsync<ArgumentException>(() => execution.Apply(output, true, true, false, false, false, journal, Token));
+        Directory.CreateDirectory(Path.GetDirectoryName(locked.TargetPath)!);
+        File.WriteAllText(locked.TargetPath, "existing destination");
+        await execution.Apply(output, true, true, true, false, false, journal, Token);
+        var entries = ReportStore.ReadJson<UndoJournal>(journal).Entries;
+        var moved = Assert.Single(entries, entry => entry.Original == encrypted);
+        Assert.Equal(bytes, File.ReadAllBytes(moved.Destination));
+        Assert.Equal("existing destination", File.ReadAllText(locked.TargetPath));
+        Assert.False(File.Exists(encrypted));
+        Assert.False(File.Exists(normal));
+        Assert.Equal(2, entries.Count);
+        var next = await classifier.Classify(Scan, P("next-plan.csv"), rules, minimum, false, 3, Token);
+        Assert.Equal("AlreadyPlaced", next.Single(row => row.Path == moved.Destination).Status);
+        await execution.Undo(journal, true, true, Token);
+        Assert.Equal(bytes, File.ReadAllBytes(encrypted));
+        Assert.True(File.Exists(normal));
+    }
+
+    [Fact]
+    public async Task EncryptedPdfNeverReachesCloudOcrEvenWithSensitiveOptIn()
+    {
+        var path = P("encrypted.pdf");
+        File.WriteAllBytes(path, Convert.FromBase64String(EncryptedPdf));
+        var store = new AiStore(root);
+        var chat = new FakeChat();
+        var reader = new FakeReader();
+        var embeddings = new FakeEmbeddings();
+        using var ai = new AiSession(new(AiMode.Cloud, AllowSensitiveCloud: true), store,
+            new CachedImageEmbedder(embeddings, store, "mock"), cloudOverride: Cloud(store, chat, reader));
+        var media = new MediaService();
+        var classifier = new ClassificationService(new(media), new(), new(), media);
+        var row = Assert.Single(await classifier.Classify(Scan, P("plan.csv"), null, 1, false, 3, Token, ai));
+        Assert.Equal("Move", row.Status);
+        Assert.Equal(Path.Combine(root, "_PasswordProtected", "encrypted.pdf"), row.TargetPath);
+        Assert.True(row.Sensitive);
+        Assert.Empty(row.AiProvider);
+        Assert.Empty(row.SuggestedFileName);
+        Assert.Equal(0, chat.Calls);
+        Assert.Equal(0, reader.Calls);
+        Assert.Equal(0, embeddings.Calls);
+    }
+
+    [Fact]
+    public void PdfProtectionInspectionReadsTrailersAndXrefDictionariesWithoutDecrypting()
+    {
+        var original = System.Text.Encoding.ASCII.GetString(Convert.FromBase64String(EncryptedPdf));
+        var path = Put("metadata.pdf", original);
+        Assert.True(PdfEncryption.IsEncrypted(path, Token));
+        var plain = original.Replace("/Encrypt 4 0 R ", "", StringComparison.Ordinal);
+        File.WriteAllText(path, plain);
+        Assert.False(PdfEncryption.IsEncrypted(path, Token));
+        var offset = original.Length;
+        File.WriteAllText(path, original + $"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 5 /Root 1 0 R /Prev 398 >>\nstartxref\n{offset}\n%%EOF\n");
+        Assert.True(PdfEncryption.IsEncrypted(path, Token));
+        File.WriteAllText(path, original + $"5 0 obj\n<< /Type /XRef /Encrypt 4 0 R /Length 0 >>\nstream\n\nendstream\nendobj\nstartxref\n{offset}\n%%EOF\n");
+        Assert.True(PdfEncryption.IsEncrypted(path, Token));
+        File.WriteAllText(path, plain + $"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 5 /Root 1 0 R /Prev {plain.Length} >>\nstartxref\n{plain.Length}\n%%EOF\n");
+        Assert.Throws<InvalidDataException>(() => PdfEncryption.IsEncrypted(path, Token));
+    }
+
+    [Fact]
+    public async Task UnverifiablePdfProtectionIsExplicitlyReportedForReview()
+    {
+        var path = Put("malformed.pdf", "%PDF-1.4\nno trustworthy trailer");
+        var media = new MediaService();
+        var classifier = new ClassificationService(new(media), new(), new(), media);
+        var row = Assert.Single(await classifier.Classify(Scan, P("plan.csv"), null, 0, false, 3, Token));
+        Assert.Equal("Review", row.Status);
+        Assert.Equal(path, row.TargetPath);
+        Assert.Contains("content was not opened", row.Reason);
+    }
+
+    [Fact]
+    public async Task EncryptedZipMetadataPreventsEntryExtractionAndPlansAnIntactMove()
+    {
+        var path = P("protected.zip");
+        using (var zip = System.IO.Compression.ZipFile.Open(path, System.IO.Compression.ZipArchiveMode.Create))
+        {
+            using var writer = new StreamWriter(zip.CreateEntry("word/document.xml").Open());
+            writer.Write("This is deliberately not XML and must not be parsed.");
+        }
+        var bytes = File.ReadAllBytes(path);
+        bytes[6] |= 1;
+        var central = bytes.AsSpan().IndexOf("PK\u0001\u0002"u8);
+        Assert.True(central >= 0);
+        bytes[central + 8] |= 1;
+        File.WriteAllBytes(path, bytes);
+        using (var zip = System.IO.Compression.ZipFile.OpenRead(path)) Assert.True(Assert.Single(zip.Entries).IsEncrypted);
+        var media = new MediaService();
+        var index = new IndexService(media);
+        var archive = Assert.Single(await new ArchiveService(index, new()).Analyze(Scan, P("zips.csv"), Token));
+        Assert.True(archive.Keep);
+        Assert.Equal("Protected", archive.Status);
+        var classifier = new ClassificationService(index, new(), new(), media);
+        var row = Assert.Single(await classifier.Classify(Scan, P("plan.csv"), null, 0.7, false, 3, Token));
+        Assert.Equal("Move", row.Status);
+        Assert.Equal(Path.Combine(root, "_PasswordProtected", "protected.zip"), row.TargetPath);
+        Assert.True(row.Sensitive);
+        Assert.Equal(bytes, File.ReadAllBytes(path));
+        var lastWrite = File.GetLastWriteTimeUtc(path);
+        var execution = new ExecutionService();
+        await execution.Apply(P("plan.csv"), true, true, true, false, false, P("undo.json"), Token);
+        Assert.Equal(bytes, File.ReadAllBytes(row.TargetPath));
+        Assert.Equal(lastWrite, File.GetLastWriteTimeUtc(row.TargetPath));
+        await execution.Undo(P("undo.json"), true, true, Token);
+        Assert.Equal(bytes, File.ReadAllBytes(path));
+    }
+
+    [Theory]
+    [InlineData(".docx")]
+    [InlineData(".xlsx")]
+    [InlineData(".pptx")]
+    [InlineData(".bin")]
+    public async Task EncryptedOfficeContainersAreDetectedFromStreamNamesWithoutOpeningPayloads(string extension)
+    {
+        var path = P("protected" + extension);
+        using (var storage = OpenMcdf.RootStorage.Create(path))
+        {
+            using var info = storage.CreateStream("EncryptionInfo");
+            using var package = storage.CreateStream("EncryptedPackage");
+            info.Write("Metadata marker only; no password parser should be invoked"u8);
+            package.Write("Not an OPC ZIP: this payload must never be opened"u8);
+        }
+        var bytes = File.ReadAllBytes(path);
+        using var store = new AiStore(root);
+        using var embeddings = new CachedImageEmbedder(new FakeEmbeddings(), store, "test");
+        var chat = new FakeChat(); var reader = new FakeReader();
+        using var ai = new AiSession(new(AiMode.Cloud, AllowSensitiveCloud: true), store, embeddings, cloudOverride: Cloud(store, chat, reader));
+        var media = new MediaService();
+        var classifier = new ClassificationService(new(media), new(), new(), media);
+        var report = P("plan.csv");
+        var row = Assert.Single(await classifier.Classify(Scan, report, null, 1, false, 3, Token, ai));
+        Assert.Equal("Move", row.Status);
+        Assert.Equal("EncryptedOffice", row.DetectedType);
+        Assert.Equal(Path.Combine(root, "_PasswordProtected", "protected" + extension), row.TargetPath);
+        Assert.True(row.Sensitive);
+        Assert.Equal(0, chat.Calls); Assert.Equal(0, reader.Calls);
+        var execution = new ExecutionService();
+        var journal = P("undo.json");
+        await execution.Apply(report, true, true, true, false, false, journal, Token);
+        Assert.False(File.Exists(path));
+        Assert.Equal(bytes, File.ReadAllBytes(row.TargetPath));
+        await execution.Undo(journal, true, true, Token);
+        Assert.Equal(bytes, File.ReadAllBytes(path));
+    }
+
+    [Fact]
+    public async Task UnencryptedCompoundFilesAreNotMistakenForProtectedOfficeFiles()
+    {
+        var path = P("ordinary.doc");
+        using (var storage = OpenMcdf.RootStorage.Create(path))
+        {
+            using var document = storage.CreateStream("WordDocument");
+            document.Write("EncryptionInfo and EncryptedPackage inside content are not metadata"u8);
+        }
+        var media = new MediaService();
+        var classifier = new ClassificationService(new(media), new(), new(), media);
+        var row = Assert.Single(await classifier.Classify(Scan, P("plan.csv"), null, 0.7, false, 3, Token));
+        Assert.Equal("Documents/Word", row.Category);
+        Assert.Equal("Move", row.Status);
     }
 
     [Fact]
