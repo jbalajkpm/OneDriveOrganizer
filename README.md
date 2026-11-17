@@ -1,10 +1,10 @@
 # OneDriveOrganizer
 
-A .NET 8 C# console application for **local, personal OneDrive folders**. Analyze first; review CSV reports; then explicitly authorize reversible cleanup or organization. Phase 3 adds local CLIP inference and explicitly opted-in Azure enrichment. There are no Microsoft Graph or online geocoding calls. Use `--ai off` for the original non-AI analysis.
+A .NET 10 C# console application for **local, personal OneDrive folders**. Analyze first; review CSV reports; then explicitly authorize reversible cleanup or organization. Phase 3 adds local CLIP inference and explicitly opted-in Azure enrichment. There are no Microsoft Graph or online geocoding calls. Use `--ai off` for the original non-AI analysis.
 
 ## Build and run
 
-Requires the .NET 8 SDK or newer. The existing Visual Studio solution and both projects target `net8.0`. Nullable, implicit usings and invariant globalization are enabled. The application uses System.CommandLine, Microsoft.Extensions.Hosting DI, SQLite, Magick.NET, MetadataExtractor, Serilog, CsvHelper, PdfPig and TagLibSharp. It does not use System.Drawing.
+Requires a stable .NET 10 SDK (10.0.100 or a later 10.0 feature band/patch). `global.json` selects the latest installed stable .NET 10 SDK; both projects target `net10.0`. Framework-dependent runs require the .NET 10 runtime; the self-contained Windows publish includes it. Nullable, implicit usings and invariant globalization are enabled. The application uses System.CommandLine, Microsoft.Extensions.Hosting DI, SQLite, Magick.NET, MetadataExtractor, Serilog, CsvHelper, PdfPig and TagLibSharp. It does not use System.Drawing.
 
 ```powershell
 dotnet restore OneDriveOrganizer.sln
@@ -228,4 +228,4 @@ Without the model variable the real-model test is explicitly skipped; mocks do n
 
 ## Next additions
 
-Microsoft Graph `quickXorHash`/delta indexing to reduce local reads; validated HEIC/RAW visual decoding; stronger Live Photo content-identifier pairing; multi-frame video fingerprints; optional offline city lookup data; calibrated labels and local OCR/captioning; an interactive visual review UI; richer PDF/Office parsers; copy support for ACLs/alternate streams; signed review receipts; and opt-in, separately reviewed backup retention management. Plan a supported .NET LTS upgrade when deployment constraints permit; .NET 8 is retained here because it was explicitly requested.
+Microsoft Graph `quickXorHash`/delta indexing to reduce local reads; validated HEIC/RAW visual decoding; stronger Live Photo content-identifier pairing; multi-frame video fingerprints; optional offline city lookup data; calibrated labels and local OCR/captioning; an interactive visual review UI; richer PDF/Office parsers; copy support for ACLs/alternate streams; signed review receipts; and opt-in, separately reviewed backup retention management. The application now targets .NET 10 LTS.
